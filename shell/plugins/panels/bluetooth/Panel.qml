@@ -6,12 +6,16 @@ import Quickshell.Bluetooth
 import Quickshell.Services.Pipewire
 import qs.Ui
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Panel {
   id: root
   moduleName: "omarchy.bluetooth"
   ipcTarget: "omarchy.bluetooth"
+  // manageIpc: false so this panel can own the single IpcHandler the target
+  // permits — needed for the toggleBluetooth method below.
+  manageIpc: false
 
   // Address -> "connecting" | "disconnecting" | "forgetting".
   // The actual Bluetooth sequencing lives in bin/omarchy-bluetooth-device;
@@ -19,6 +23,13 @@ Panel {
   property var pendingActions: ({})
 
   readonly property var adapter: Bluetooth.defaultAdapter
+
+  // True while this instance owes BlueZ a StopDiscovery: set when it starts
+  // discovery (or opens onto a session already running) and cleared once
+  // discovery is confirmed down after close. Ownership, not state — BlueZ's
+  // Discovering property also reflects sessions other clients hold, which are
+  // never this panel's to stop.
+  property bool owesDiscoveryStop: false
   readonly property var devices: Bluetooth.devices ? Bluetooth.devices.values : []
   readonly property var pipewireNodes: Pipewire.nodes ? Pipewire.nodes.values : []
   property var pendingAudioOutputDevice: null
@@ -54,19 +65,19 @@ Panel {
 
   property int phraseIndex: 0
   readonly property var activePhrases: [
-    "Untangling wires",
-    "Streaming vikings",
-    "Pairing mysteries",
-    "Herding headsets",
-    "Taming radios",
-    "Summoning speakers",
-    "Wrangling codecs",
-    "Polishing packets"
+    Commons.I18n.t("bluetooth.phrase1"),
+    Commons.I18n.t("bluetooth.phrase2"),
+    Commons.I18n.t("bluetooth.phrase3"),
+    Commons.I18n.t("bluetooth.phrase4"),
+    Commons.I18n.t("bluetooth.phrase5"),
+    Commons.I18n.t("bluetooth.phrase6"),
+    Commons.I18n.t("bluetooth.phrase7"),
+    Commons.I18n.t("bluetooth.phrase8")
   ]
   readonly property bool rotatingPhrases: adapter && adapter.enabled
   readonly property string heroStatusText: {
-    if (!adapter) return "No adapter"
-    if (!adapter.enabled) return "Turned Off"
+    if (!adapter) return Commons.I18n.t("bluetooth.noAdapter")
+    if (!adapter.enabled) return Commons.I18n.t("bluetooth.turnedOff")
     return activePhrases[phraseIndex % activePhrases.length]
   }
 
@@ -91,13 +102,13 @@ Panel {
   // sits above the device sections so the adapter can be toggled by keyboard
   // even when it is off and no device rows exist.
   readonly property bool headerHasCursor: cursorActive && focusSection === "header"
-  readonly property string toggleHint: root.adapter && root.adapter.enabled ? "Turn Bluetooth off" : "Turn Bluetooth on"
+  readonly property string toggleHint: root.adapter && root.adapter.enabled ? Commons.I18n.t("bluetooth.turnOff") : Commons.I18n.t("bluetooth.turnOn")
 
   readonly property color hoverFill: bar
-    ? Style.hoverFillFor(bar.foreground, Color.accent)
+    ? Style.hoverFillFor(bar.foreground, Commons.Color.accent)
     : "transparent"
   readonly property color selectedFill: bar
-    ? Style.selectedFillFor(bar.foreground, Color.accent)
+    ? Style.selectedFillFor(bar.foreground, Commons.Color.accent)
     : "transparent"
 
   function sectionCount(section) {
@@ -129,11 +140,34 @@ Panel {
   readonly property var scrollRows: {
     var rows = []
     for (var k = 0; k < knownDevices.length; k++)
-      rows.push({ dev: knownDevices[k], section: "known", indexInSection: k })
+      rows.push({ dev: Model.deviceRow(knownDevices[k]), section: "known", indexInSection: k })
     if (sectionVisible("discovered"))
       for (var d = 0; d < discoveredDevices.length; d++)
-        rows.push({ dev: discoveredDevices[d], section: "discovered", indexInSection: d })
+        rows.push({ dev: Model.deviceRow(discoveredDevices[d]), section: "discovered", indexInSection: d })
     return rows
+  }
+
+  // Connected devices render above the scroll area; same primitives-only
+  // projection so those delegates never hold Device QObject wrappers either.
+  readonly property var connectedRows: {
+    var rows = []
+    for (var i = 0; i < connectedDevices.length; i++)
+      rows.push(Model.deviceRow(connectedDevices[i]))
+    return rows
+  }
+
+  // Live BlueZ device behind a row. Rows carry primitives only, so actions
+  // resolve the backend object here rather than holding a wrapper that can
+  // dangle mid-incubation. `devices` is already the raw device array (see the
+  // property declaration), so it is iterated directly.
+  function deviceFor(row) {
+    if (!row || !row.dev) return null
+    var addr = row.dev.address || ""
+    var devs = devices || []
+    for (var i = 0; i < devs.length; i++) {
+      if ((devs[i].address || "") === addr) return devs[i]
+    }
+    return null
   }
 
   // Flat position of the keyboard cursor, or -1 while it sits on the hero or
@@ -150,7 +184,7 @@ Panel {
     var rows = scrollRows
     if (index < 0 || index >= rows.length) return ""
     if (index > 0 && rows[index - 1].section === rows[index].section) return ""
-    return rows[index].section === "known" ? "PAIRED" : "AVAILABLE"
+    return rows[index].section === "known" ? Commons.I18n.t("bluetooth.paired") : Commons.I18n.t("bluetooth.available")
   }
 
   function audioSinks() {
@@ -374,6 +408,10 @@ Panel {
 
   onOpenedChanged: {
     if (opened) {
+      // Adopt a discovery session that is already running — a popout handoff
+      // from another monitor, or one leaked by an instance that could not
+      // finish its own stop — so this close settles it either way.
+      if (adapter !== null && adapter.discovering) owesDiscoveryStop = true
       if (connectedDevices.length > 0) { focusSection = "connected"; selectedIndex = 0 }
       else if (knownDevices.length > 0) { focusSection = "known"; selectedIndex = 0 }
       else if (discoveredDevices.length > 0) { focusSection = "discovered"; selectedIndex = 0 }
@@ -381,6 +419,19 @@ Panel {
       actionFocused = false
       cursorActive = false
     }
+  }
+
+  // Another per-monitor instance of this widget whose panel is open, if any.
+  // All instances share the default adapter, and switching the popout to a
+  // different monitor closes one instance as it opens the next, so the
+  // closing side has to leave the scan alone for the side still on screen.
+  function openSibling() {
+    if (!bar || typeof bar.moduleWidgets !== "function") return null
+    var items = bar.moduleWidgets(moduleName)
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && items[i] !== root && items[i].opened === true) return items[i]
+    }
+    return null
   }
 
   function updateFocusedAddress() {
@@ -460,7 +511,71 @@ Panel {
     repeat: true
     triggeredOnStart: true
     running: root.opened && root.adapter !== null && root.adapter.enabled && !root.adapter.discovering
-    onTriggered: root.adapter.discovering = true
+    onTriggered: {
+      root.owesDiscoveryStop = true
+      root.adapter.discovering = true
+    }
+  }
+
+  // The way back down. The BlueZ discovery session behind adapter.discovering
+  // is held by quickshell's D-Bus connection, so nothing ends it at close:
+  // without this timer, one visit to the panel left the radio in inquiry
+  // until the next shell restart, starving A2DP audio on the same controller
+  // into stutters.
+  //
+  // A timer bound to the confirmed state rather than a write at close time:
+  // quickshell only forwards a discovering write that differs from the last
+  // state BlueZ reported, so a stop issued while a just-fired StartDiscovery
+  // is still awaiting confirmation would be swallowed and leak the session.
+  // Binding to adapter.discovering means a confirmation landing at any point
+  // after close re-arms the stop, and a reopen inside the first interval
+  // keeps the scan running uninterrupted. Attempts are bounded so a session
+  // some other BlueZ client keeps up cannot draw StopDiscovery fire forever.
+  Timer {
+    id: discoveryStop
+    interval: 1000
+    repeat: true
+    property int attempts: 0
+    running: !root.opened && root.owesDiscoveryStop && root.adapter !== null && root.adapter.discovering === true
+    onRunningChanged: if (running) attempts = 0
+    onTriggered: {
+      // The scan now serves the open panel, so the debt moves with it — B may
+      // have opened before BlueZ confirmed A's start, in which case B's own
+      // open-time adoption saw nothing to adopt.
+      var sibling = root.openSibling()
+      if (sibling) {
+        sibling.owesDiscoveryStop = true
+        root.owesDiscoveryStop = false
+        return
+      }
+      attempts += 1
+      if (attempts > 3) { root.owesDiscoveryStop = false; return }
+      root.adapter.discovering = false
+    }
+  }
+
+  // The debt is settled the moment BlueZ reports discovery down — whether
+  // because the stop above landed or the session ended some other way — so a
+  // stale claim never touches a scan another client starts later. While the
+  // panel is open, discoveryRetry re-incurs it as it restarts the scan.
+  Connections {
+    target: root.adapter
+    function onDiscoveringChanged() {
+      if (!root.adapter.discovering) root.owesDiscoveryStop = false
+    }
+  }
+
+  // A destroyed instance cannot wait for BlueZ confirmations, so it hands any
+  // debt to a surviving sibling — whose declarative stop catches even a start
+  // confirmed after this object is gone — and only writes the stop directly
+  // when it is the last one standing.
+  Component.onDestruction: {
+    if (!owesDiscoveryStop) return
+    var items = bar && typeof bar.moduleWidgets === "function" ? bar.moduleWidgets(moduleName) : []
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && items[i] !== root) { items[i].owesDiscoveryStop = true; return }
+    }
+    if (adapter !== null && adapter.discovering) adapter.discovering = false
   }
 
   Timer {
@@ -488,15 +603,15 @@ Panel {
   SequentialAnimation {
     id: phraseSwap
     PropertyAnimation {
-      target: heroStatus; property: "opacity"
-      to: 0.0; duration: 180; easing.type: Easing.OutQuad
+      target: panel.loadedContent ? panel.loadedContent.heroStatus : null; property: "opacity"
+      to: 0.0; duration: Style.duration(180); easing.type: Easing.OutQuad
     }
     ScriptAction {
       script: root.phraseIndex = (root.phraseIndex + 1) % root.activePhrases.length
     }
     PropertyAnimation {
-      target: heroStatus; property: "opacity"
-      to: 1.0; duration: 260; easing.type: Easing.InQuad
+      target: panel.loadedContent ? panel.loadedContent.heroStatus : null; property: "opacity"
+      to: 1.0; duration: Style.duration(260); easing.type: Easing.InQuad
     }
   }
 
@@ -505,14 +620,33 @@ Panel {
     function onRotatingPhrasesChanged() {
       if (!root.rotatingPhrases) {
         phraseSwap.stop()
-        heroStatus.opacity = 1.0
+        if (panel.loadedContent) panel.loadedContent.heroStatus.opacity = 1.0
       }
     }
   }
 
+  // Not adapter.enabled: that writes BlueZ's Powered, which nothing persists, so
+  // the adapter came back on at the next boot. omarchy-bluetooth-power moves the
+  // rfkill soft block instead, which systemd-rfkill restores across reboots.
+  // Powered still follows the block, so the switch and icon read it as before.
+  //
+  // Asking for a direction rather than a toggle: the helper runs detached and the
+  // switch only moves once BlueZ catches up, so a second click inside that window
+  // would re-read the old state and undo the first.
   function toggleBluetooth() {
     if (!adapter) return
-    adapter.enabled = !adapter.enabled
+    Quickshell.execDetached(["omarchy-bluetooth-power", adapter.enabled ? "off" : "on"])
+  }
+
+  ShellIpc {
+    target: "omarchy.bluetooth"
+
+    function open() { root.open() }
+    function close() { root.close() }
+    function show() { root.open() }
+    function hide() { root.close() }
+    function toggle() { root.toggle() }
+    function toggleBluetooth() { root.toggleBluetooth() }
   }
 
   BarIconButton {
@@ -532,12 +666,14 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: panel.loadedContent
     contentWidth: panel.fittedContentWidth(Style.space(380))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+    contentHeight: panel.fittedContentHeight(panel.loadedContentHeight)
 
-    PanelKeyCatcher {
+    content: PanelKeyCatcher {
       id: keyCatcher
+      property alias heroStatus: heroStatus
+      implicitHeight: column.implicitHeight
       anchors.fill: parent
       onMoveRequested: function(dx, dy) {
         if (!root.cursorActive) { root.cursorActive = true; return }
@@ -565,6 +701,7 @@ Panel {
           // Status only — the switch owns toggling, mouse and keyboard alike.
           Text {
             id: heroIcon
+            textFormat: Text.PlainText
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             text: root.icon
@@ -604,7 +741,8 @@ Panel {
             spacing: Style.space(2)
 
             Text {
-              text: "Bluetooth"
+              text: Commons.I18n.t("bluetooth.title")
+              textFormat: Text.PlainText
               color: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.title
@@ -615,6 +753,7 @@ Panel {
 
             Text {
               id: heroStatus
+              textFormat: Text.PlainText
               text: root.heroStatusText.toUpperCase()
               color: Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
@@ -640,13 +779,13 @@ Panel {
           spacing: Style.space(10)
 
           PanelSectionHeader {
-            text: "CONNECTED"
+            text: Commons.I18n.t("bluetooth.connected")
             foreground: root.bar.foreground
             fontFamily: root.bar.fontFamily
           }
 
           Repeater {
-            model: root.connectedDevices
+            model: root.connectedRows
             DeviceRow {
               required property var modelData
               required property int index
@@ -730,10 +869,11 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           visible: root.connectedDevices.length === 0 && root.scrollRows.length === 0
-          text: !root.adapter ? "No Bluetooth adapter"
-              : !root.adapter.enabled ? "Turn Bluetooth on to scan"
-              : "Scanning for devices…"
+          text: !root.adapter ? Commons.I18n.t("bluetooth.noBluetoothAdapter")
+              : !root.adapter.enabled ? Commons.I18n.t("bluetooth.turnOnToScan")
+              : Commons.I18n.t("bluetooth.scanning")
           color: Qt.darker(root.bar.foreground, 1.5)
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.bodySmall
@@ -758,9 +898,9 @@ Panel {
     readonly property string action: root.pendingAction(dev ? dev.address : "")
     readonly property string actionTooltip: {
       if (!dev) return ""
-      if (isConnected) return "Disconnect"
-      if (isDiscovered) return "Pair"
-      return "Connect"
+      if (isConnected) return Commons.I18n.t("bluetooth.disconnect")
+      if (isDiscovered) return Commons.I18n.t("bluetooth.pair")
+      return Commons.I18n.t("bluetooth.connect")
     }
 
     readonly property bool rowSelected: root.cursorActive && root.focusSection === sectionName && root.selectedIndex === rowIndex
@@ -775,13 +915,13 @@ Panel {
 
     readonly property string statusText: {
       if (!dev) return ""
-      if (action === "forgetting") return "Forgetting…"
-      if (action === "disconnecting" || devState === 2) return "Disconnecting…"
+      if (action === "forgetting") return Commons.I18n.t("bluetooth.forgetting")
+      if (action === "disconnecting" || devState === 2) return Commons.I18n.t("bluetooth.disconnecting")
       if (isConnected) {
-        if (dev.batteryAvailable) return Math.round(dev.battery * 100) + "%"
-        return sectionName === "connected" ? "" : "Connected"
+        if (dev.batteryAvailable) return Commons.I18n.formatNumber(Math.round(dev.battery * 100)) + "%"
+        return sectionName === "connected" ? "" : Commons.I18n.t("bluetooth.connectedStatus")
       }
-      if (action === "connecting" || devState === 3 || dev.pairing === true) return "Connecting…"
+      if (action === "connecting" || devState === 3 || dev.pairing === true) return Commons.I18n.t("bluetooth.connecting")
       if (isDiscovered) return ""
       return ""
     }
@@ -809,14 +949,15 @@ Panel {
       }
 
       onClicked: function(mouse) {
-        if (!row.dev) return
+        var dev = root.deviceFor(row)
+        if (!dev) return
         if (mouse.button === Qt.RightButton) {
-          if (row.isConnected) root.disconnectDevice(row.dev)
-          else if (!row.isDiscovered) root.forgetDevice(row.dev)
+          if (row.isConnected) root.disconnectDevice(dev)
+          else if (!row.isDiscovered) root.forgetDevice(dev)
           return
         }
-        if (row.isConnected) root.disconnectDevice(row.dev)
-        else root.connectDevice(row.dev)
+        if (row.isConnected) root.disconnectDevice(dev)
+        else root.connectDevice(dev)
       }
     }
 
@@ -837,6 +978,7 @@ Panel {
 
       Text {
         id: deviceIcon
+        textFormat: Text.PlainText
         text: row.isConnected ? "󰂱" : "󰂯"
         color: row.statusColor
         font.family: root.bar.fontFamily
@@ -855,7 +997,8 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
 
         Text {
-          text: root.deviceLabel(row.dev) || "Device"
+          textFormat: Text.PlainText
+          text: root.deviceLabel(row.dev) || Commons.I18n.t("bluetooth.device")
           color: root.bar.foreground
           font.family: root.bar.fontFamily
           font.pixelSize: Style.font.body
@@ -863,6 +1006,7 @@ Panel {
           width: parent.width
         }
         Text {
+          textFormat: Text.PlainText
           visible: row.statusText !== ""
           text: row.statusText
           color: row.statusColor
@@ -879,7 +1023,7 @@ Panel {
         anchors.verticalCenter: parent.verticalCenter
         visible: row.showForgetButton
         iconText: "󰅙"
-        tooltipText: "Forget"
+        tooltipText: Commons.I18n.t("bluetooth.forget")
         foreground: root.bar.foreground
         hoverColor: root.bar.foreground
         fontFamily: root.bar.fontFamily
@@ -895,8 +1039,9 @@ Panel {
           root.actionFocused = true
         }
         onClicked: {
-          if (!row.dev) return
-          root.forgetDevice(row.dev)
+          var dev = root.deviceFor(row)
+          if (!dev) return
+          root.forgetDevice(dev)
         }
       }
     }

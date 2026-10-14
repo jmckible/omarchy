@@ -65,61 +65,41 @@ pick() {
   CALLS=$(cat "$TMPDIR/calls")
 }
 
-# Two plugins can declare the same display name. When both are eligible for the
-# same verb, neither row can stand on the name alone.
+# Two plugins can declare the same display name. The id rides along as row
+# subtext and comes back with the selection, so the pick resolves by id.
 cat >"$TMPDIR/plugins.json" <<'JSON'
 [
   {"id": "omarchy.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": true},
-  {"id": "local.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": false}
+  {"id": "tester.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": false}
 ]
 JSON
 
-pick enable "Clock (local.clock)"
-[[ $ROWS == *"Clock (omarchy.clock)"* && $ROWS == *"Clock (local.clock)"* ]] \
-  || fail "picker tells two plugins of the same name apart" "$ROWS"
-pass "picker tells two plugins of the same name apart"
-[[ $CALLS == *"omarchy-plugin-enable local.clock"* ]] \
+pick enable "$(printf 'Clock\ttester.clock')"
+[[ $ROWS == *"$(printf 'Clock\tomarchy.clock')"* && $ROWS == *"$(printf 'Clock\ttester.clock')"* ]] \
+  || fail "picker offers the id as subtext on every row" "$ROWS"
+pass "picker offers the id as subtext on every row"
+[[ $CALLS == *"omarchy-plugin-enable tester.clock"* ]] \
   || fail "picker acts on the row that was picked, not the one that shares its name" "$CALLS"
 pass "picker acts on the row that was picked, not the one that shares its name"
 
-# Only one of them is eligible, so the row needs no id -- but resolving it by
-# name alone would still find the wrong plugin, since the other one exists.
-cat >"$TMPDIR/plugins.json" <<'JSON'
-[
-  {"id": "omarchy.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": true, "active": false, "canDisable": true, "firstParty": true},
-  {"id": "local.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": false}
-]
-JSON
-
-pick enable "Clock"
-[[ $ROWS != *"("* ]] || fail "picker adorns a row only when its name is taken twice over" "$ROWS"
-pass "picker adorns a row only when its name is taken twice over"
-[[ $CALLS == *"omarchy-plugin-enable local.clock"* ]] \
-  || fail "picker resolves a lone row to the plugin the verb offered, not a namesake it filtered out" "$CALLS"
-pass "picker resolves a lone row to the plugin the verb offered, not a namesake it filtered out"
-
-pick remove "Clock"
-[[ $CALLS == *"omarchy-plugin-remove local.clock"* ]] \
+pick remove "$(printf 'Clock\ttester.clock')"
+[[ $CALLS == *"omarchy-plugin-remove tester.clock"* ]] \
   || fail "picker removes the plugin whose row was picked" "$CALLS"
 pass "picker removes the plugin whose row was picked"
 
-# A name that stands alone is left alone: no id trailing a row that needs none.
 cat >"$TMPDIR/plugins.json" <<'JSON'
 [
   {"id": "acme.weather", "name": "Weather", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": false}
 ]
 JSON
 
-pick enable "Weather"
-[[ $ROWS == *"Weather"* && $ROWS != *"acme.weather)"* ]] \
-  || fail "picker leaves an unambiguous name unadorned" "$ROWS"
-pass "picker leaves an unambiguous name unadorned"
+pick enable "$(printf 'Weather\tacme.weather')"
 [[ $CALLS == *"omarchy-plugin-enable acme.weather"* ]] \
   || fail "picker delegates plugin enablement to the plugin command" "$CALLS"
 pass "picker delegates plugin enablement to the plugin command"
 
-# Clone offers only first-party plugins without an existing local counterpart,
-# then performs the clone and opens its deterministic path in $EDITOR.
+# Clone offers only first-party plugins that no installed clone points back at,
+# then hands the pick to the clone command, which opens the result in $EDITOR.
 cat >"$TMPDIR/plugins.json" <<'JSON'
 [
   {"id": "omarchy.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": true, "active": false, "canDisable": true, "firstParty": true},
@@ -127,19 +107,20 @@ cat >"$TMPDIR/plugins.json" <<'JSON'
 ]
 JSON
 
-pick clone "Clock"
+pick clone "$(printf 'Clock\tomarchy.clock')"
 [[ $ROWS == *"Clock"* && $ROWS != *"Weather"* ]] ||
   fail "clone picker offers only built-in plugins" "$ROWS"
 pass "clone picker offers built-in plugins"
-[[ $CALLS == *'terminal: omarchy-plugin-clone omarchy.clock && exec $EDITOR '*"/.config/omarchy/plugins/local.clock" ]] ||
-  fail "clone picker opens the cloned path in EDITOR" "$CALLS"
-pass "clone picker clones and opens the local plugin"
+[[ $CALLS == *"terminal: omarchy-plugin-clone omarchy.clock --edit"* ]] ||
+  fail "clone picker delegates cloning and editing to the clone command" "$CALLS"
+pass "clone picker clones and opens the personal plugin"
 
-# Once local.<id> is discovered, the source no longer belongs in Clone.
+# Once a clone pointing back at the source is discovered, whatever it is named,
+# the source no longer belongs in Clone.
 cat >"$TMPDIR/plugins.json" <<'JSON'
 [
   {"id": "omarchy.clock", "name": "Clock", "kinds": ["bar-widget"], "enabled": true, "active": false, "canDisable": true, "firstParty": true},
-  {"id": "local.clock", "name": "My Clock", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": false}
+  {"id": "tester.clock", "name": "My Clock", "kinds": ["bar-widget"], "enabled": false, "active": false, "canDisable": true, "firstParty": false, "clonedFrom": "omarchy.clock"}
 ]
 JSON
 
@@ -156,7 +137,7 @@ cat >"$TMPDIR/plugins.json" <<'JSON'
 ]
 JSON
 
-pick enable "Fancy"
+pick enable "$(printf 'Fancy\tacme.fancy')"
 [[ $CALLS == *"omarchy-plugin-enable acme.fancy"* && $CALLS != *"--section"* ]] \
   || fail "picker delegates kind-specific enablement" "$CALLS"
 pass "picker delegates kind-specific enablement"
@@ -170,7 +151,7 @@ cat >"$TMPDIR/plugins.json" <<'JSON'
 ]
 JSON
 
-pick disable "Clock"
+pick disable "$(printf 'Clock\tomarchy.clock')"
 [[ $ROWS == *"Clock"* && $ROWS != *"Fancy"* ]] \
   || fail "picker keeps a bar out of disable" "$ROWS"
 pass "picker keeps a bar out of disable"
@@ -179,11 +160,11 @@ pass "picker keeps a bar out of disable"
 cat >"$TMPDIR/plugins.json" <<'JSON'
 [
   {"id": "omarchy.bar", "name": "Bar", "kinds": ["bar"], "enabled": false, "active": false, "canDisable": false, "firstParty": true},
-  {"id": "local.neon-bar", "name": "Neon Bar", "kinds": ["bar"], "enabled": true, "active": true, "canDisable": false, "firstParty": false}
+  {"id": "tester.neon-bar", "name": "Neon Bar", "kinds": ["bar"], "enabled": true, "active": true, "canDisable": false, "firstParty": false}
 ]
 JSON
 
-pick enable "Bar"
+pick enable "$(printf 'Bar\tomarchy.bar')"
 [[ $ROWS == *"Bar"* && $ROWS != *"Neon Bar"* ]] \
   || fail "picker offers every bar except the one already running" "$ROWS"
 pass "picker offers every bar except the one already running"
